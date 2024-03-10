@@ -167,7 +167,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    print("Rotary Pos Embed", q.shape, cos.shape, sin.shape)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -230,7 +229,9 @@ class NNDBLookup(nn.Module):
         # Each key is a weighted sum of `query_states` in the window.
         lookup_keys = self.hidden_to_key(hidden_states)
         lookup_keys = lookup_keys.unfold(
-            1, min(self.key_context, lookup_keys.shape[1]), 1
+            dimension=1,
+            size=min(self.key_context, lookup_keys.shape[1]),
+            step=self.key_context,
         )
         lookup_keys = lookup_keys.mean(dim=-1)
 
@@ -297,96 +298,6 @@ class HaystackAttention(nn.Module):
             base=self.rope_theta,
         )
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        key_states = key_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
-        value_states = value_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
-
-        past_key_value = getattr(self, "past_key_value", past_key_value)
-        cos, sin = self.rotary_emb(value_states, position_ids, seq_len=None)
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin, None
-        )
-
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; position_ids needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        attn_weights = torch.matmul(
-            query_states, key_states.transpose(2, 3)
-        ) / math.sqrt(self.head_dim)
-
-        if attention_mask is not None:  # no matter the length, we just slice it
-            if cache_position is not None:
-                causal_mask = attention_mask[
-                    :, :, cache_position, : key_states.shape[-2]
-                ]
-            else:
-                causal_mask = attention_mask
-            attn_weights = attn_weights + causal_mask
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(
-            attn_weights, p=self.attention_dropout, training=self.training
-        )
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-
-        attn_output = attn_output.view(bsz, q_len, -1)
-        attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
-
-
-# Copied from transformers.models.llama.modeling_llama.LlamaSdpaAttention with Llama->Haystack
-class HaystackSdpaAttention(HaystackAttention):
-    """
-    Haystack attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
-    `HaystackAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
-    SDPA API.
-    """
-
     # Ignore copy
     def forward(
         self,
@@ -431,14 +342,14 @@ class HaystackSdpaAttention(HaystackAttention):
         ).transpose(1, 2)
 
         cos, sin = self.rotary_emb(value_states, position_ids, seq_len=None)
-        print(
-            "Before Rotary: ",
-            query_states.shape,
-            key_states.shape,
-            cos.shape,
-            sin.shape,
-            position_ids.shape,
-        )
+        # print(
+        #     "Before Rotary: ",
+        #     query_states.shape,
+        #     key_states.shape,
+        #     cos.shape,
+        #     sin.shape,
+        #     position_ids.shape,
+        # )
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin, None
         )
@@ -482,21 +393,13 @@ class HaystackSdpaAttention(HaystackAttention):
         return attn_output, None, past_key_value
 
 
-HAYSTACK_ATTENTION_CLASSES = {
-    "eager": HaystackAttention,
-    "sdpa": HaystackSdpaAttention,
-}
-
-
 # Copied from transformers.models.llama.modeling_llama.LlamaDecoderLayer with LLAMA->HAYSTACK,Llama->Haystack
 class HaystackDecoderLayer(nn.Module):
     def __init__(self, config: HaystackConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = HAYSTACK_ATTENTION_CLASSES[config._attn_implementation](
-            config=config, layer_idx=layer_idx
-        )
+        self.self_attn = HaystackAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = HaystackMLP(config)
         self.input_layernorm = HaystackRMSNorm(
@@ -826,28 +729,27 @@ class HaystackModel(HaystackPreTrainedModel):
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             past_seen_tokens = past_key_values.get_seq_length()
 
-        if cache_position is None:
-            cache_position = torch.arange(
-                past_seen_tokens,
-                past_seen_tokens + inputs_embeds.shape[1],
-                device=inputs_embeds.device,
-            )
-
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
         batch_size, seq_length = inputs_embeds.shape[:2]
         dtype = inputs_embeds.dtype
         device = inputs_embeds.device
-        num_db_lookups = max(1, seq_length // self.config.key_context)
         causal_mask = self._update_causal_mask(
             attention_mask,
             batch_size,
-            seq_length + num_db_lookups,
+            seq_length,
             dtype,
             device,
             inputs_embeds,
         )
+
+        if cache_position is None:
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + attention_mask.shape[1],
+                device=inputs_embeds.device,
+            )
 
         # embed positions
         hidden_states = inputs_embeds
@@ -860,18 +762,7 @@ class HaystackModel(HaystackPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for i, decoder_layer in enumerate(self.layers):
-            print(
-                "Layer: ",
-                i,
-                hidden_states.shape,
-                causal_mask.shape,
-                position_ids.shape,
-                past_key_values,
-                output_attentions,
-                use_cache,
-                cache_position,
-            )
+        for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1076,6 +967,18 @@ class HaystackForCausalLM(HaystackPreTrainedModel):
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
+        num_db_lookups = max(1, attention_mask.shape[1] // self.config.key_context)
+        attention_mask = F.pad(
+            attention_mask,
+            (num_db_lookups, 0),
+            value=1,
+        )
+
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 1)
+        if past_key_values:
+            position_ids = position_ids[:, -attention_mask.shape[1] :]
+
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
@@ -1159,23 +1062,13 @@ class HaystackForCausalLM(HaystackPreTrainedModel):
             ):
                 attention_mask = attention_mask[:, -max_cache_length:]
 
-        num_db_lookups = max(1, attention_mask.shape[1] // self.config.key_context)
-        attention_mask = F.pad(
-            attention_mask,
-            (num_db_lookups, 0),
-            value=1,
-        )
-
         position_ids = kwargs.get("position_ids", None)
-        print("Position ids?", position_ids)
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
                 position_ids = position_ids[:, -attention_mask.shape[1] :]
-
-        print("Prepare: ", input_ids.shape, attention_mask.shape, position_ids)
 
         if self.generation_config.cache_implementation == "static":
             # generation with static cache
