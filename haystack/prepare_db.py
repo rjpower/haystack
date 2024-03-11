@@ -1,4 +1,5 @@
 import annoy
+import itertools
 import datasets
 import numpy as np
 import pandas as pd
@@ -6,18 +7,18 @@ import torch
 import tqdm
 import transformers
 
-DATASET = "mikex86/stackoverflow-posts"
+# DATASET = "mikex86/stackoverflow-posts"
+CACHE_DIR = "./cache"
+DATASET = "allenai/peS2o"
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 EMBED_DIM = 384
 KEY_WINDOW = 32
 VALUE_WINDOW = 64
-BATCH_SIZE = 16
-MAX_DOCUMENTS = 1000 * 1000
+BATCH_SIZE = 128
+MAX_DOCUMENTS = 10 * 1000 * 1000
 
 tokenizer = transformers.AutoTokenizer.from_pretrained(EMBED_MODEL)
-model = transformers.AutoModel.from_pretrained(
-    EMBED_MODEL, trust_remote_code=True, safe_serialization=True
-)
+model = transformers.AutoModel.from_pretrained(EMBED_MODEL)
 
 if torch.cuda.is_available():
     model = model.to("cuda")
@@ -28,8 +29,8 @@ model.eval()
 
 
 def split(record):
-    tokens = [tokenizer.tokenize(body) for body in record["Body"]]
-    token_ids = tokenizer(record["Body"], return_tensors="np")
+    tokens = [tokenizer.tokenize(body) for body in record["text"]]
+    token_ids = tokenizer(record["text"], return_tensors="np")
 
     num_docs = token_ids["input_ids"].shape[0]
     result = []
@@ -81,7 +82,7 @@ def encode(record):
         if "_tokens" in k:
             continue
         else:
-            splits[k] = torch.tensor(v).to("mps")
+            splits[k] = torch.tensor(v).to("cuda")
 
     with torch.no_grad():
         key_embedding = model(
@@ -94,36 +95,49 @@ def encode(record):
 
     return {
         "key_embedding": key_embedding,
-        "value_input_ids": splits["value_input_ids"],
-        "value_token_type_ids": splits["value_token_type_ids"],
-        "value_attention_mask": splits["value_attention_mask"],
+        "value_input_ids": splits["value_input_ids"].cpu().numpy(),
+        "value_token_type_ids": splits["value_token_type_ids"].cpu().numpy(),
         "key_tokens": splits["key_tokens"],
         "value_tokens": splits["value_tokens"],
     }
 
 
-ds = datasets.load_dataset(DATASET, split="train", streaming=True)
-DS_KEYS = list(next(iter(ds)).keys())
+def create_ann_and_value_db():
+    ds = datasets.load_dataset(
+        DATASET,
+        split="train",
+        cache_dir=CACHE_DIR,
+        streaming=True,
+    )
+    DS_KEYS = list(next(iter(ds)).keys())
 
-encode_ds = ds[:MAX_DOCUMENTS].map(
-    encode,
-    batch_size=BATCH_SIZE,
-    batched=True,
-    remove_columns=DS_KEYS,
-)
+    encode_ds = ds.map(
+        encode,
+        batch_size=BATCH_SIZE,
+        batched=True,
+        remove_columns=DS_KEYS,
+    )
 
-value_db = []
-index = annoy.AnnoyIndex(EMBED_DIM, "angular")
-tqdm_iter = tqdm.tqdm(iter(encode_ds, total=MAX_DOCUMENTS * 5))
-for i, batch in enumerate(tqdm_iter):
-    if i % 100 == 0:
-        tqdm_iter.set_description(f"Indexing {i} {' '.join(batch['key_tokens'])}")
+    encode_ds = encode_ds.take(MAX_DOCUMENTS)
 
-    value_db.append(batch["value_input_ids"])
-    index.add_item(i, batch["key_embedding"])
+    encode_iter = tqdm.tqdm(encode_ds, total=MAX_DOCUMENTS)
+    index = annoy.AnnoyIndex(EMBED_DIM, "angular")
+    index.on_disk_build("data/keys.index")
+    value_db = np.empty((MAX_DOCUMENTS, VALUE_WINDOW), dtype=np.int32)
 
-index.build(10)
-index.save("index.ann")
+    for i, batch in enumerate(itertools.islice(encode_iter, MAX_DOCUMENTS)):
+        if i % 100 == 0:
+            title = " ".join(batch["key_tokens"])[:80]
+            encode_iter.set_description(f"Indexing {i} {title}")
 
-value_db = np.concatenate(value_db, axis=0)
-np.save("value_db.npy", value_db)
+        value_db[i, :] = batch["value_input_ids"]
+        index.add_item(i, batch["key_embedding"])
+
+    np.save("data/value_tokens", value_db)
+    del value_db
+
+    index.build(10)
+
+
+if __name__ == "__main__":
+    create_ann_and_value_db()
