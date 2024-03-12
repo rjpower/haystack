@@ -121,10 +121,12 @@ class HaystackConfig(PretrainedConfig):
         attention_bias=False,
         attention_dropout=0.0,
         db_size=1024,
-        key_size=128,
-        embedding_size=128,
+        key_size=384,
+        embedding_size=384,
         key_context=32,
         value_context=64,
+        key_index="data/keys.index",
+        value_array="data/value_tokens.npy",
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -148,6 +150,8 @@ class HaystackConfig(PretrainedConfig):
         self.embedding_size = embedding_size
         self.key_context = key_context
         self.value_context = value_context
+        self.key_index = key_index
+        self.value_array = value_array
 
         super().__init__(
             pad_token_id=pad_token_id,

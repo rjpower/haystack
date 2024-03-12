@@ -15,9 +15,11 @@
 # limitations under the License.
 """PyTorch Haystack model."""
 
+import annoy
 import math
 import warnings
 from typing import List, Optional, Tuple, Union
+import numpy as np
 
 import torch
 import torch.nn.functional as F
@@ -61,22 +63,6 @@ if is_torch_fx_available():
 
 
 logger = logging.get_logger(__name__)
-
-_CONFIG_FOR_DOC = "HaystackConfig"
-
-
-def _get_unpad_data(attention_mask):
-    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(
-        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0)
-    )
-    return (
-        indices,
-        cu_seqlens,
-        max_seqlen_in_batch,
-    )
 
 
 class HaystackRMSNorm(nn.Module):
@@ -203,6 +189,10 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+KEY_ANN = None
+VALUE_ARRAY = None
+
+
 class NNDBLookup(nn.Module):
     """Nearest Neighbor Database Lookup."""
 
@@ -211,14 +201,20 @@ class NNDBLookup(nn.Module):
 
     def __init__(self, config: HaystackConfig):
         super().__init__()
+        self.config = config
         self.hidden_to_key = nn.Linear(config.hidden_size, config.key_size)
-        self.embedding_to_hidden = nn.Linear(config.embedding_size, config.hidden_size)
+        self.hidden_to_weight = nn.Linear(config.hidden_size, 1)
+        self.embedding_to_hidden = nn.Embedding(config.vocab_size, config.hidden_size)
         self.key_context = config.key_context
         self.value_context = config.value_context
-        self.keys = nn.Linear(config.key_size, config.db_size)
-        self.db = nn.Embedding(
-            config.db_size, config.embedding_size, padding_idx=config.pad_token_id
-        )
+
+        global KEY_ANN, VALUE_ARRAY
+        if KEY_ANN is None:
+            # KEY_ANN = annoy.AnnoyIndex(config.embedding_size, "angular")
+            # KEY_ANN.load("data/keys.index")
+            KEY_ANN = 1
+
+            VALUE_ARRAY = torch.from_numpy(np.load("data/value_tokens.npy")).cuda()
 
     def forward(self, hidden_states: torch.Tensor):
         # Perform a database update and prepend the database lookup to the hidden states.
@@ -235,14 +231,30 @@ class NNDBLookup(nn.Module):
         )
         lookup_keys = lookup_keys.mean(dim=-1)
 
-        db_lookup = lookup_keys.matmul(self.keys.weight.t())
-        db_lookup = lookup_keys.argmax(dim=-1)
-        _, indices = torch.topk(db_lookup, dim=1, k=min(25, db_lookup.shape[1]))
+        # Lookup keys in the annoy index
+        top_k = 1
 
-        # Lookup the database embeddings and prepend them to the hidden states.
-        db_lookup = self.db(indices)
-        db_lookup = self.embedding_to_hidden(db_lookup)
-        return db_lookup
+        # iterate over batch and sequence dimensions and lookup nearest neighbor for
+        # each lookup_key. then gather the corresponding value from the VALUE_ARRAY
+        # and reshape to (batch, seq, embedding_size)
+        value_indices = []
+        for batch in range(lookup_keys.shape[0]):
+            for seq in range(lookup_keys.shape[1]):
+                value_indices.append(1)
+                # value_indices.append(
+                #     KEY_ANN.get_nns_by_vector(lookup_keys[batch, seq], top_k)
+                # )
+
+        value_indices = torch.tensor(value_indices).cuda()
+        value_indices = value_indices.view(-1)
+
+        values = torch.index_select(VALUE_ARRAY, 0, value_indices)
+        values = self.embedding_to_hidden(values)
+        values = values.view(
+            lookup_keys.shape[0], lookup_keys.shape[1] * self.config.value_context, -1
+        )
+
+        return values
 
 
 class HaystackAttention(nn.Module):
@@ -864,7 +876,11 @@ class HaystackForCausalLM(HaystackPreTrainedModel):
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
-        num_db_lookups = max(1, attention_mask.shape[1] // self.config.key_context)
+        num_db_lookups = max(
+            1,
+            self.config.value_context
+            * (attention_mask.shape[1] // self.config.key_context),
+        )
         attention_mask = F.pad(
             attention_mask,
             (num_db_lookups, 0),
